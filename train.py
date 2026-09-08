@@ -1,194 +1,264 @@
-import torch
-import argparse
+"""
+YOLOP Training Script.
+
+Usage:
+    # Full training:
+    python train.py --config configs/bdd100k.yaml
+
+    # Resume from last checkpoint:
+    python train.py --config configs/bdd100k.yaml --resume last.pt
+
+    # Resume from specific epoch checkpoint:
+    python train.py --config configs/bdd100k.yaml --resume checkpoints/epoch_005.pt
+
+    # Overfit smoke-test (N images, 20 epochs):
+    python train.py --config configs/bdd100k.yaml --smoke-test --smoke-n 15
+
+    # Short 1-epoch training test:
+    python train.py --config configs/bdd100k.yaml --max-epochs 1 --val-subset 50
+"""
+
 import os
 import time
-from pathlib import Path
+import argparse
+import yaml
+import torch
+from torch.utils.data import DataLoader, Subset
+from torch.amp import autocast, GradScaler
+
 from yolop.model.yolop import YOLOP
 from yolop.losses.multi_task_loss import YOLOPLoss
 from yolop.utils.checkpoint import save_checkpoint, load_checkpoint
-from yolop.datasets.bdd100k_dataset import YOLOPDataset
-from torch.utils.data import DataLoader
-import yaml
-import subprocess
+from yolop.datasets.bdd100k_dataset import BDD100KDataset
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+
+# ──────────────────────────────────────────────────────────────────────────────
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, epoch):
     model.train()
-    running_loss = 0.0
-    start_time = time.time()
-    
-    for batch in loader:
-        images = batch['images'].to(device)
-        targets = {k: {sk: sv.to(device) for sk, sv in v.items()} if isinstance(v, dict) else v.to(device) 
-                   for k, v in batch['targets'].items()}
-        
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss, det_loss, drv_loss, lane_loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item()
-        
-    elapsed = time.time() - start_time
-    return running_loss / len(loader), elapsed
+    total_loss = det_sum = drv_sum = lane_sum = 0.0
+    t0 = time.time()
+    n  = len(loader)
 
-def validate_one_epoch(model, loader, criterion, device):
-    model.eval()
-    total_loss = 0.0
-    total_det = 0.0
-    total_drv = 0.0
-    total_lane = 0.0
+    for i, batch in enumerate(loader):
+        images  = batch['images'].to(device, non_blocking=True)
+        targets = {
+            'det': {
+                scale: t.to(device, non_blocking=True)
+                for scale, t in batch['targets']['det'].items()
+            },
+            'drv':  batch['targets']['drv'].to(device,  non_blocking=True),
+            'lane': batch['targets']['lane'].to(device, non_blocking=True),
+        }
 
-    with torch.no_grad():
-        for batch in loader:
-            images = batch['images'].to(device)
-            targets = {k: {sk: sv.to(device) for sk, sv in v.items()} if isinstance(v, dict) else v.to(device) 
-                       for k, v in batch['targets'].items()}
-            
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast('cuda', enabled=scaler.is_enabled()):
             outputs = model(images)
-            loss, det_loss, drv_loss, lane_loss = criterion(outputs, targets)
-            
-            total_loss += loss.item()
-            total_det += det_loss.item()
-            total_drv += drv_loss.item()
-            total_lane += lane_loss.item()
+            loss, det_l, drv_l, lane_l = criterion(outputs, targets)
 
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        det_sum    += det_l.item()
+        drv_sum    += drv_l.item()
+        lane_sum   += lane_l.item()
+
+        if (i + 1) % max(1, n // 5) == 0:
+            print(f"  [{i+1}/{n}] loss={loss.item():.4f}  "
+                  f"det={det_l.item():.4f}  "
+                  f"drv={drv_l.item():.4f}  "
+                  f"lane={lane_l.item():.4f}")
+
+    elapsed = time.time() - t0
+    return {
+        'total': total_loss / n,
+        'det':   det_sum / n,
+        'drv':   drv_sum / n,
+        'lane':  lane_sum / n,
+        'time':  elapsed,
+    }
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device):
+    model.eval()
+    total_loss = det_sum = drv_sum = lane_sum = 0.0
     n = len(loader)
-    return total_loss/n, total_det/n, total_drv/n, total_lane/n
 
+    for batch in loader:
+        images  = batch['images'].to(device, non_blocking=True)
+        targets = {
+            'det': {
+                scale: t.to(device, non_blocking=True)
+                for scale, t in batch['targets']['det'].items()
+            },
+            'drv':  batch['targets']['drv'].to(device,  non_blocking=True),
+            'lane': batch['targets']['lane'].to(device, non_blocking=True),
+        }
+        with autocast('cuda', enabled=device.type == 'cuda'):
+            outputs = model(images)
+            loss, det_l, drv_l, lane_l = criterion(outputs, targets)
+
+        total_loss += loss.item()
+        det_sum    += det_l.item()
+        drv_sum    += drv_l.item()
+        lane_sum   += lane_l.item()
+
+    return {
+        'total': total_loss / n,
+        'det':   det_sum / n,
+        'drv':   drv_sum / n,
+        'lane':  lane_sum / n,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+def build_loaders(config, args):
+    archive = args.archive_root or config['ARCHIVE_ROOT']
+    img_h, img_w = config['IMG_H'], config['IMG_W']
+
+    n_smoke = args.smoke_n if args.smoke_test else None
+
+    train_ds = BDD100KDataset(archive, split='train',
+                               img_size=(img_h, img_w),
+                               max_samples=n_smoke)
+
+    val_ds   = BDD100KDataset(archive, split='val',
+                               img_size=(img_h, img_w),
+                               max_samples=n_smoke)
+
+    # Optionally limit val to a subset for speed
+    val_subset = args.val_subset or config.get('VAL_SUBSET_SIZE')
+    if val_subset and not args.smoke_test:
+        val_ds = Subset(val_ds, list(range(min(int(val_subset), len(val_ds)))))
+
+    nw = 0 if args.smoke_test else config['NUM_WORKERS']
+    bs = args.batch_size or config['BATCH_SIZE']
+
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
+                               num_workers=nw, pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False,
+                               num_workers=nw, pin_memory=True)
+    return train_loader, val_loader
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/bdd100k.yaml")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-    parser.add_argument("--dataset_root", type=str, default=None, help="Override dataset directory")
-    parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument("--skip-preview", action="store_true")
+    parser = argparse.ArgumentParser(description='YOLOP Training')
+    parser.add_argument('--config',       default='configs/bdd100k.yaml')
+    parser.add_argument('--resume',       default=None, help='Path to checkpoint')
+    parser.add_argument('--archive-root', default=None, help='Override ARCHIVE_ROOT')
+    parser.add_argument('--smoke-test',   action='store_true',
+                        help='Overfit on a tiny subset (smoke-test)')
+    parser.add_argument('--smoke-n',      type=int, default=15,
+                        help='Number of images for smoke-test')
+    parser.add_argument('--max-epochs',   type=int, default=None)
+    parser.add_argument('--batch-size',   type=int, default=None)
+    parser.add_argument('--val-subset',   type=int, default=None)
     args = parser.parse_args()
 
-    with open(args.config, 'r') as f:
+    with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    # 1. Dataset Root resolution
-    dataset_root = args.dataset_root if args.dataset_root else config.get('DATASET_DIR')
-    if not dataset_root:
-        raise ValueError("Error: No dataset path provided in config or CLI.")
-    
-    dataset_path = Path(dataset_root)
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Error: Dataset directory not found at {dataset_path}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
+    # ── Model ────────────────────────────────────────────────────────
     model = YOLOP(
         num_classes_det=config['NUM_CLASSES_DET'],
         num_classes_seg=config['NUM_CLASSES_SEG'],
-        num_lanes=config['NUM_LANES']
+        img_size=(config['IMG_H'], config['IMG_W']),
     ).to(device)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['LEARNING_RATE'])
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {n_params/1e6:.1f}M")
+
+    # ── Optimiser & Scheduler ────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config['LEARNING_RATE'],
+        weight_decay=config['WEIGHT_DECAY'],
+    )
+    max_ep = args.max_epochs or (30 if args.smoke_test else config['EPOCHS'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max_ep, eta_min=1e-6
+    )
+
     criterion = YOLOPLoss(
         lambda_det=config['LAMBDA_DET'],
         lambda_drv=config['LAMBDA_DRV'],
-        lambda_lane=config['LAMBDA_LANE']
+        lambda_lane=config['LAMBDA_LANE'],
+        num_classes_det=config['NUM_CLASSES_DET'],
     ).to(device)
 
+    scaler = GradScaler('cuda', enabled=device.type == 'cuda')
+
+    # ── Resume ───────────────────────────────────────────────────────
     start_epoch = 0
     best_metric = float('inf')
-
     if args.resume:
-        start_epoch, model, optimizer, _, best_metric = load_checkpoint(
-            args.resume, model, optimizer, None, best_metric
-        )
-        start_epoch += 1
+        start_epoch, model, optimizer, scheduler, best_metric = \
+            load_checkpoint(args.resume, model, optimizer, scheduler)
+        start_epoch += 1  # next epoch
+
+    # ── Data ─────────────────────────────────────────────────────────
+    train_loader, val_loader = build_loaders(config, args)
 
     if args.smoke_test:
-        print("Running Smoke Test (Short)...")
-        class DummyLoader:
-            def __init__(self, size): self.size = size
-            def __len__(self): return self.size
-            def __iter__(self):
-                for _ in range(self.size):
-                    yield {'images': torch.randn(1, 3, 384, 640), 
-                           'targets': {'det': {'p3':torch.randn(1,15,96,160), 'p4':torch.randn(1,15,48,80), 'p5':torch.randn(1,15,24,40)}, 
-                                       'drv': {'p3':torch.randint(0,19,(1,96,160)), 'p4':torch.randint(0,19,(1,48,80))}, 
-                                       'lane': torch.randn(1,4,96,160)}}
-        
-        loader = DummyLoader(5)
-        for epoch in range(start_epoch, start_epoch + 2):
-            avg_loss, epoch_time = train_one_epoch(model, loader, optimizer, criterion, device)
-            print(f"Epoch [{epoch+1}/{config['EPOCHS']}] | Loss: {avg_loss:.4f} | Time: {epoch_time:.2f}s")
-            
-            state = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_metric': best_metric,
-                'config': config
-            }
-            save_checkpoint(state, False, config['CHECKPOINT_DIR'], 
-                           os.path.join(config['CHECKPOINT_DIR'], 'last.pt'),
-                           os.path.join(config['CHECKPOINT_DIR'], 'best.pt'),
-                           keep_last_n=config['KEEP_LAST_N'])
-        return
+        print(f"\n{'='*60}")
+        print(f"SMOKE TEST: {args.smoke_n} images, {max_ep} epochs")
+        print('='*60)
 
-    # 3. Preview Step
-    if not args.skip_preview:
-        print("Running Pre-training Dataset Preview...")
-        try:
-            # Use the venv python to run the preview script
-            subprocess.run(["./.venv/bin/python3", "scripts/preview_dataset.py", "--dataset_root", str(dataset_path)], check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Preview failed: {e}")
-            raise
+    # ── Training loop ────────────────────────────────────────────────
+    for epoch in range(start_epoch, max_ep):
+        print(f"\nEpoch [{epoch+1}/{max_ep}]  lr={optimizer.param_groups[0]['lr']:.6f}")
 
-    print("Starting Full Training...")
-    train_dataset = YOLOPDataset(dataset_path, split='train', img_size=(config['IMG_H'], config['IMG_W']))
-    train_loader = DataLoader(train_dataset, batch_size=config['BATCH_SIZE'], shuffle=True, num_workers=config['NUM_WORKERS'])
+        train_m = train_one_epoch(model, train_loader, optimizer, criterion,
+                                   scaler, device, epoch)
+        val_m   = validate(model, val_loader, criterion, device)
 
-    # Validation Loader
-    val_dataset = YOLOPDataset(dataset_path, split='val', img_size=(config['IMG_H'], config['IMG_W']))
-    
-    # Handle subset validation if config says so
-    val_subset_size = config.get('VAL_SUBSET_SIZE')
-    if val_subset_size and val_subset_size > 0:
-        print(f"Validating on subset of size {val_subset_size}...")
-        from torch.utils.data import Subset
-        indices = list(range(min(val_subset_size, len(val_dataset))))
-        val_dataset = Subset(val_dataset, indices)
+        scheduler.step()
 
-    val_loader = DataLoader(val_dataset, batch_size=config['BATCH_SIZE'], shuffle=False, num_workers=config['NUM_WORKERS'])
+        print(f"  TRAIN total={train_m['total']:.4f}  "
+              f"det={train_m['det']:.4f}  drv={train_m['drv']:.4f}  "
+              f"lane={train_m['lane']:.4f}  time={train_m['time']:.1f}s")
+        print(f"  VAL   total={val_m['total']:.4f}  "
+              f"det={val_m['det']:.4f}  drv={val_m['drv']:.4f}  "
+              f"lane={val_m['lane']:.4f}")
 
-    total_start_time = time.time()
-    for epoch in range(start_epoch, config['EPOCHS']):
-        avg_train_loss, train_epoch_time = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        
-        # Run Validation
-        avg_val_loss, val_det, val_drv, val_lane = validate_one_epoch(model, val_loader, criterion, device)
-        
-        print(f"Epoch [{epoch+1}/{config['EPOCHS']}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Det: {val_det:.3f} | Val Drv: {val_drv:.3f} | Val Lane: {val_lane:.3f} | Time: {train_epoch_time:.2f}s")
-        
-        current_metric = avg_val_loss 
-        is_best = current_metric < best_metric
+        is_best = val_m['total'] < best_metric
         if is_best:
-            best_metric = current_metric
+            best_metric = val_m['total']
 
         state = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'epoch':              epoch,
+            'model_state_dict':   model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'best_metric': best_metric,
-            'config': config
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_metric':        best_metric,
+            'train_metrics':      train_m,
+            'val_metrics':        val_m,
+            'config':             config,
         }
-        save_checkpoint(state, is_best, config['CHECKPOINT_DIR'], 
-                       os.path.join(config['CHECKPOINT_DIR'], 'last.pt'),
-                       os.path.join(config['CHECKPOINT_DIR'], 'best.pt'),
-                       keep_last_n=config['KEEP_LAST_N'])
-        
-        print(f"Checkpoint size (last.pt): {os.path.getsize(os.path.join(config['CHECKPOINT_DIR'], 'last.pt'))/1e6:.2f} MB")
+        save_checkpoint(
+            state, is_best,
+            checkpoint_dir=config['CHECKPOINT_DIR'],
+            last_path=config['LAST_MODEL_PATH'],
+            best_path=config['BEST_MODEL_PATH'],
+            keep_last_n=config['KEEP_LAST_N'],
+        )
 
-    total_elapsed = time.time() - total_start_time
-    print(f"\nTraining Complete! Total Time: {total_elapsed:.2f}s")
+    print("\nDone.")
+    if args.smoke_test:
+        print(f"Final train loss: {train_m['total']:.4f}  "
+              f"(should be decreasing for overfit to work)")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

@@ -1,32 +1,29 @@
 # YOLOP BDD100K Config
 
-# Dataset Path
-DATASET_DIR: "dataset/bdd100k"
+# Dataset – root of the archive/ directory
+ARCHIVE_ROOT: "/home/piet/Desktop/yolop/archive"
 
-# Model Parameters
-NUM_CLASSES_DET: 10  # To be updated after inspection
-NUM_CLASSES_SEG: 19  # To be updated after inspection
-NUM_LANES: 4         # To be updated after inspection
-
-# Input Size
+# Model Parameters (matched to actual BDD100K)
+NUM_CLASSES_DET: 10   # bike,bus,car,motor,person,rider,traffic light,traffic sign,train,truck
+NUM_CLASSES_SEG: 3    # 0=bg, 1=direct drivable, 2=alternative drivable
 IMG_H: 384
 IMG_W: 640
 
-# Training Parameters
-BATCH_SIZE: 16
+# Training
+BATCH_SIZE: 8
 EPOCHS: 30
-LEARNING_RATE: 0.01
+LEARNING_RATE: 0.001
 WEIGHT_DECAY: 0.0005
 NUM_WORKERS: 4
-VAL_SUBSET_SIZE: null  # Use full val set if null
+VAL_SUBSET_SIZE: 500   # validate on subset each epoch (set null for full val)
 
-# Checkpoint and Logging
-KEEP_LAST_N: 3
-CHECKPOINT_DIR: "checkpoints"
-BEST_MODEL_PATH: "best.pt"
-LAST_MODEL_PATH: "last.pt"
-
-# Loss Weights
+# Loss weights
 LAMBDA_DET: 1.0
 LAMBDA_DRV: 1.0
 LAMBDA_LANE: 1.0
+
+# Checkpoints
+CHECKPOINT_DIR: "checkpoints"
+BEST_MODEL_PATH: "best.pt"
+LAST_MODEL_PATH: "last.pt"
+KEEP_LAST_N: 3

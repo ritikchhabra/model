@@ -1,101 +1,152 @@
+"""
+YOLOP Inference Script.
+
+Usage:
+    python inference.py --weights best.pt --image path/to/img.jpg
+    python inference.py --weights best.pt --dir bdd100k_samples/ --n 5
+"""
+
 import os
+import argparse
 import cv2
-import torch
 import numpy as np
+import torch
+import torch.nn.functional as F
 from pathlib import Path
+
 from yolop.model.yolop import YOLOP
-import torchvision.transforms as transforms
 
-def run_inference():
-    os.makedirs("logs/inference_test", exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
+ORIG_H, ORIG_W = 720, 1280
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def preprocess(img_bgr, img_h=384, img_w=640):
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (img_w, img_h))
+    img = img.astype(np.float32) / 255.0
+    img = (img - MEAN) / STD
+    tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).float()
+    return tensor
+
+
+def visualise(orig_bgr, det_outs, drv_out, lane_out, img_h=384, img_w=640):
+    h, w = orig_bgr.shape[:2]
+    canvas = orig_bgr.copy()
+
+    # ── Drivable area overlay ────────────────────────────────────────
+    drv_prob  = F.softmax(drv_out[0], dim=0).cpu().numpy()  # [3, H, W]
+    drv_class = np.argmax(drv_prob, axis=0)                  # [H, W]
+    drv_resized = cv2.resize(drv_class.astype(np.uint8), (w, h),
+                              interpolation=cv2.INTER_NEAREST)
+    drv_overlay = canvas.copy()
+    drv_overlay[drv_resized == 1] = [0, 200, 0]   # direct  = green
+    drv_overlay[drv_resized == 2] = [0, 150, 80]  # alternative = teal
+    canvas = cv2.addWeighted(drv_overlay, 0.45, canvas, 0.55, 0)
+
+    # ── Lane overlay ─────────────────────────────────────────────────
+    lane_mask = torch.sigmoid(lane_out[0, 0]).cpu().numpy()  # [H, W]
+    lane_resized = cv2.resize(lane_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+    canvas[lane_resized > 0.4] = (canvas[lane_resized > 0.4] * 0.5
+                                    + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+
+    # ── Detection: top peaks from p3 heatmap ────────────────────────
+    det_p3 = torch.sigmoid(det_outs['p3'][0, 0]).cpu().numpy()  # [H_s, W_s]
+    flat = det_p3.flatten()
+    top_k = min(20, len(flat))
+    top_idx = np.argsort(flat)[-top_k:][::-1]
+    gs_h, gs_w = det_p3.shape
+    for idx in top_idx:
+        conf = flat[idx]
+        if conf < 0.3:
+            continue
+        gy, gx = divmod(int(idx), gs_w)
+        cx = int(gx / gs_w * w)
+        cy = int(gy / gs_h * h)
+        bw = int(w * 0.07)
+        bh = int(h * 0.10)
+        x1, y1 = max(0, cx - bw//2), max(0, cy - bh//2)
+        x2, y2 = min(w, cx + bw//2), min(h, cy + bh//2)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(canvas, f'{conf:.2f}', (x1, max(y1-4, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+    return canvas
+
+
+def run(model, img_bgr, device, img_h=384, img_w=640):
+    tensor = preprocess(img_bgr, img_h, img_w).to(device)
+    with torch.no_grad():
+        outputs = model(tensor)
+    return outputs
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--weights',  default='best.pt')
+    parser.add_argument('--config',   default='configs/bdd100k.yaml')
+    parser.add_argument('--image',    default=None, help='Single image path')
+    parser.add_argument('--dir',      default=None, help='Directory of images')
+    parser.add_argument('--n',        type=int, default=5)
+    parser.add_argument('--out-dir',  default='logs/inference_test')
+    args = parser.parse_args()
+
+    import yaml
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
     # Load model
-    print("Loading model...")
-    model = YOLOP(num_classes_det=10, num_classes_seg=19, num_lanes=4).to(device)
-    try:
-        model.load_state_dict(torch.load("checkpoints/best.pt", map_location=device, weights_only=True))
-    except Exception as e:
-        print(f"Warning: Failed to load best.pt ({e}). Using uninitialized weights.")
+    model = YOLOP(
+        num_classes_det=config['NUM_CLASSES_DET'],
+        num_classes_seg=config['NUM_CLASSES_SEG'],
+        img_size=(config['IMG_H'], config['IMG_W']),
+    ).to(device)
+
+    print(f"Loading weights: {args.weights}")
+    state_dict = torch.load(args.weights, map_location=device, weights_only=True)
+    # best.pt is a plain state_dict
+    if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+        state_dict = state_dict['model_state_dict']
+    model.load_state_dict(state_dict)
     model.eval()
+    print("Model loaded.")
 
-    # Preprocessing
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((384, 640))
-    ])
+    # Collect images
+    if args.image:
+        img_paths = [Path(args.image)]
+    elif args.dir:
+        img_paths = sorted(Path(args.dir).glob('*.jpg'))[:args.n]
+    else:
+        # default: use bdd100k_samples if it exists
+        img_paths = sorted(Path('bdd100k_samples').glob('*.jpg'))[:args.n]
 
-    image_paths = list(Path("bdd100k_samples").glob("*.jpg"))
-    if not image_paths:
-        print("No test images found.")
+    if not img_paths:
+        print("No images found.")
         return
 
-    print(f"Running inference on {len(image_paths)} images...")
-    with torch.no_grad():
-        for i, img_path in enumerate(image_paths):
-            print(f"Processing {img_path.name}")
-            
-            # Read image
-            orig_img = cv2.imread(str(img_path))
-            if orig_img is None:
-                continue
-            
-            # Convert BGR to RGB and normalize
-            img_rgb = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
-            input_tensor = transform(img_rgb).unsqueeze(0).to(device)
-            
-            # Forward pass
-            outputs = model(input_tensor)
-            
-            # Process outputs (naive heuristic)
-            h, w = orig_img.shape[:2]
-            overlay = orig_img.copy()
+    os.makedirs(args.out_dir, exist_ok=True)
+    img_h, img_w = config['IMG_H'], config['IMG_W']
 
-            # 1. Drivable Area (argmax of p3 output)
-            drv_p3 = outputs["drv"]["p3"][0]  # [C, H, W]
-            drv_mask = torch.argmax(drv_p3, dim=0).cpu().numpy()
-            
-            # Resize mask to original image size
-            drv_mask_resized = cv2.resize(drv_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-            
-            # Overlay Drivable Area (Green)
-            overlay[drv_mask_resized > 0] = [0, 255, 0]
+    for img_path in img_paths:
+        orig = cv2.imread(str(img_path))
+        if orig is None:
+            print(f"  [SKIP] Cannot read: {img_path}")
+            continue
 
-            # 2. Lanes (threshold of lane output)
-            lane_out = outputs["lane"][0]  # [C, H, W]
-            lane_mask = torch.max(lane_out, dim=0)[0].cpu().numpy()
-            lane_mask_resized = cv2.resize(lane_mask, (w, h), interpolation=cv2.INTER_LINEAR)
-            
-            # Overlay Lanes (Blue)
-            overlay[lane_mask_resized > 0.5] = [255, 0, 0]
+        outputs = run(model, orig, device, img_h, img_w)
+        result  = visualise(orig, outputs['det'], outputs['drv'], outputs['lane'],
+                             img_h, img_w)
 
-            # 3. Detections (find peaks in det_out p3)
-            det_p3 = outputs["det"]["p3"][0] # [15, H, W]
-            # Sum over classes (first 10 channels) to find objectness peak
-            obj_map = torch.sum(det_p3[:10], dim=0).cpu().numpy()
-            
-            # Find top 5 peaks
-            flat_indices = np.argsort(obj_map.flatten())[-5:]
-            for idx in flat_indices:
-                py, px = np.unravel_index(idx, obj_map.shape)
-                val = obj_map[py, px]
-                if val > 0.5: # arbitrary threshold
-                    # Map to original image size
-                    x_center = int(px * w / obj_map.shape[1])
-                    y_center = int(py * h / obj_map.shape[0])
-                    # Draw arbitrary box
-                    box_w, box_h = int(w * 0.1), int(h * 0.1)
-                    x1, y1 = max(0, x_center - box_w//2), max(0, y_center - box_h//2)
-                    x2, y2 = min(w, x_center + box_w//2), min(h, y_center + box_h//2)
-                    cv2.rectangle(orig_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            
-            # Blend
-            final_img = cv2.addWeighted(overlay, 0.4, orig_img, 0.6, 0)
-            
-            # Save
-            out_path = f"logs/inference_test/pred_{img_path.name}"
-            cv2.imwrite(out_path, final_img)
-            print(f"Saved {out_path}")
+        out_path = os.path.join(args.out_dir, f'pred_{img_path.name}')
+        cv2.imwrite(out_path, result)
+        print(f"  Saved: {out_path}")
 
-if __name__ == "__main__":
-    run_inference()
+    print("Done.")
+
+
+if __name__ == '__main__':
+    main()
