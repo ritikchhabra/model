@@ -1,0 +1,13 @@
+torch
+torchvision
+numpy
+opencv-python
+pyyaml
+tqdm
+scipy
+pillow
+matplotlib
+tensorboard
+onnx
+onnxruntime
+onnxsim

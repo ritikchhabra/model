@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+checkpoints/*.pt
+checkpoints/*.pth
+*.onnx
+runs/
+logs/
+tensorboard/
+dataset/
+archive/
+venv/
+datasets/
+bdd100k_samples/
+all_project_code.txt
+yolop_full_code_dump.txt
